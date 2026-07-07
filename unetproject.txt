@@ -1,0 +1,348 @@
+# =====================================================================
+# 1. SETUP AND CONFIGURATIONS
+# =====================================================================
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from datasets import load_dataset
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+# Hyperparameters & Configurations
+BATCH_SIZE = 8
+LR = 0.0001
+EPOCHS = 10
+IMAGE_SIZE = 256
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+PIN_MEMORY = DEVICE == "cuda"  # Only useful with GPU
+
+print(f"Using device: {DEVICE}")
+
+# =====================================================================
+# 2. DATA AUGMENTATIONS (ALBUMENTATIONS)
+# =====================================================================
+train_transform = A.Compose([
+    A.Resize(IMAGE_SIZE, IMAGE_SIZE),
+    A.HorizontalFlip(p=0.5),
+    A.VerticalFlip(p=0.5),
+    A.RandomRotate90(p=0.5),
+    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ToTensorV2(),
+])
+
+val_transform = A.Compose([
+    A.Resize(IMAGE_SIZE, IMAGE_SIZE),
+    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ToTensorV2(),
+])
+
+# =====================================================================
+# 3. DATASET CLASS
+# =====================================================================
+class TreeDataset(Dataset):
+    def __init__(self, hf_dataset_split, transform=None):
+        self.dataset = hf_dataset_split
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+
+        # Force image to standard 3-channel RGB numpy array
+        image = np.array(item['image'].convert("RGB"))
+
+        # Extract mask — handle both 2D (H,W) and 3D (H,W,C) layouts
+        mask = np.array(item['annotation'])
+        if len(mask.shape) == 3:
+            mask = mask[:, :, 0]
+
+        # Binary mask: class 1 (individual tree) + class 2 (canopy) → 1, background → 0
+        mask = (mask > 0).astype(np.float32)
+
+        # Apply synchronized transforms to image and mask together
+        if self.transform:
+            augmented = self.transform(image=image, mask=mask)
+            image = augmented['image']
+            mask = augmented['mask'].unsqueeze(0)  # (1, H, W)
+
+        return image, mask
+
+# =====================================================================
+# 4. DICE LOSS (handles class imbalance — trees are a small fraction)
+# =====================================================================
+def dice_loss(pred, target, smooth=1.0):
+    # pred and target: (B, 1, H, W)
+    intersection = (pred * target).sum(dim=(2, 3))
+    union = pred.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
+    dice = (2.0 * intersection + smooth) / (union + smooth)
+    return (1 - dice).mean()
+
+def combined_loss(pred, target):
+    bce = nn.BCELoss()(pred, target)
+    d_loss = dice_loss(pred, target)
+    return bce + d_loss
+
+# =====================================================================
+# 5. U-NET ARCHITECTURE
+# =====================================================================
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class UNet(nn.Module):
+    def __init__(self, in_channels=3, out_channels=1, features=[64, 128, 256, 512]):
+        super().__init__()
+        self.ups = nn.ModuleList()
+        self.downs = nn.ModuleList()
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # Encoder
+        for feature in features:
+            self.downs.append(DoubleConv(in_channels, feature))
+            in_channels = feature
+
+        # Decoder
+        for feature in reversed(features):
+            self.ups.append(nn.ConvTranspose2d(feature * 2, feature, kernel_size=2, stride=2))
+            self.ups.append(DoubleConv(feature * 2, feature))
+
+        self.bottleneck = DoubleConv(features[-1], features[-1] * 2)
+        self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
+
+    def forward(self, x):
+        skip_connections = []
+
+        for down in self.downs:
+            x = down(x)
+            skip_connections.append(x)
+            x = self.pool(x)
+
+        x = self.bottleneck(x)
+        skip_connections = skip_connections[::-1]
+
+        for idx in range(0, len(self.ups), 2):
+            x = self.ups[idx](x)
+            skip_connection = skip_connections[idx // 2]
+
+            if x.shape[2:] != skip_connection.shape[2:]:
+                x = nn.functional.interpolate(x, size=skip_connection.shape[2:],
+                                               mode="bilinear", align_corners=False)
+
+            concat_x = torch.cat((skip_connection, x), dim=1)
+            x = self.ups[idx + 1](concat_x)
+
+        return torch.sigmoid(self.final_conv(x))
+
+# =====================================================================
+# 6. EVALUATION FUNCTION (IoU + loss on validation set)
+# =====================================================================
+def evaluate(model, loader, device):
+    model.eval()
+    total_loss, total_iou = 0.0, 0.0
+
+    with torch.no_grad():
+        for data, targets in loader:
+            data = data.to(device)
+            targets = targets.to(device)
+
+            preds = model(data)
+            loss = combined_loss(preds, targets)
+            total_loss += loss.item()
+
+            # IoU: threshold predictions at 0.5 for binary tree/non-tree
+            preds_binary = (preds > 0.5).float()
+            intersection = (preds_binary * targets).sum(dim=(2, 3))
+            union = preds_binary.sum(dim=(2, 3)) + targets.sum(dim=(2, 3)) - intersection
+            iou = (intersection / (union + 1e-8)).mean()
+            total_iou += iou.item()
+
+    avg_loss = total_loss / len(loader)
+    avg_iou = total_iou / len(loader)
+    return avg_loss, avg_iou
+
+# =====================================================================
+# 7. LOAD DATASET & INITIALIZE
+# =====================================================================
+print("Loading dataset from Hugging Face...")
+hf_ds = load_dataset("restor/tcd")
+
+train_ds = TreeDataset(hf_ds['train'], transform=train_transform)
+test_ds = TreeDataset(hf_ds['test'], transform=val_transform)
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                          num_workers=0, pin_memory=PIN_MEMORY)
+test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False,
+                         num_workers=0, pin_memory=PIN_MEMORY)
+
+model = UNet(in_channels=3, out_channels=1).to(DEVICE)
+optimizer = optim.Adam(model.parameters(), lr=LR)
+
+# LR scheduler: halves LR if val loss stops improving for 2 epochs
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=2, factor=0.5)
+
+# =====================================================================
+# 8. PRE-FLIGHT DATA CHECK
+# =====================================================================
+print("\n--- RUNNING PRE-FLIGHT DATA CHECK ---")
+images, masks = next(iter(train_loader))
+
+print(f"Image shape : {images.shape}  (expected [8, 3, 256, 256])")
+print(f"Mask shape  : {masks.shape}   (expected [8, 1, 256, 256])")
+
+unique_vals = torch.unique(masks).tolist()
+print(f"Unique mask values: {unique_vals}")
+
+if len(unique_vals) <= 1:
+    raise ValueError("CRITICAL: Masks are blank. Check dataset annotation column name.")
+else:
+    print("✅ Data integrity verified. Proceeding to training.\n")
+
+# =====================================================================
+# 9. TRAINING LOOP WITH VALIDATION AND BEST MODEL SAVING
+# =====================================================================
+train_losses, val_losses, val_ious = [], [], []
+best_val_iou = 0.0
+best_epoch = 0
+
+print(f"Starting training on: {DEVICE}")
+print("=" * 60)
+
+for epoch in range(EPOCHS):
+    # --- Training ---
+    model.train()
+    train_loss = 0.0
+    loop = tqdm(train_loader, total=len(train_loader), leave=True)
+
+    for data, targets in loop:
+        data = data.to(DEVICE)
+        targets = targets.to(DEVICE)
+
+        predictions = model(data)
+        loss = combined_loss(predictions, targets)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item()
+        loop.set_description(f"Epoch [{epoch+1}/{EPOCHS}]")
+        loop.set_postfix(loss=f"{loss.item():.4f}")
+
+    avg_train_loss = train_loss / len(train_loader)
+    train_losses.append(avg_train_loss)
+
+    # --- Validation ---
+    val_loss, val_iou = evaluate(model, test_loader, DEVICE)
+    val_losses.append(val_loss)
+    val_ious.append(val_iou)
+
+    # Step LR scheduler based on validation loss
+    scheduler.step(val_loss)
+
+    print(f"Epoch {epoch+1:02d} | Train Loss: {avg_train_loss:.4f} | "
+          f"Val Loss: {val_loss:.4f} | Val IoU: {val_iou:.4f}")
+
+    # Save only the best model by IoU (not every epoch)
+    if val_iou > best_val_iou:
+        best_val_iou = val_iou
+        best_epoch = epoch + 1
+        torch.save(model.state_dict(), "unet_tree_seg_best.pth")
+        print(f"  ✅ New best model saved (IoU: {best_val_iou:.4f})")
+
+print("\n" + "=" * 60)
+print(f"Training complete. Best Val IoU: {best_val_iou:.4f} at epoch {best_epoch}")
+print("Best model saved to: unet_tree_seg_best.pth")
+
+# =====================================================================
+# 10. PLOT TRAINING CURVES
+# =====================================================================
+epochs_range = range(1, EPOCHS + 1)
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+ax1.plot(epochs_range, train_losses, label="Train Loss", marker='o')
+ax1.plot(epochs_range, val_losses, label="Val Loss", marker='o')
+ax1.set_title("Loss Curve")
+ax1.set_xlabel("Epoch")
+ax1.set_ylabel("Loss (BCE + Dice)")
+ax1.legend()
+ax1.grid(True)
+
+ax2.plot(epochs_range, val_ious, label="Val IoU", marker='o', color='green')
+ax2.axvline(x=best_epoch, color='red', linestyle='--', label=f'Best Epoch ({best_epoch})')
+ax2.set_title("Validation IoU (Tree Segmentation)")
+ax2.set_xlabel("Epoch")
+ax2.set_ylabel("IoU")
+ax2.legend()
+ax2.grid(True)
+
+plt.tight_layout()
+plt.savefig("training_curves.png", dpi=150)
+plt.show()
+print("Training curves saved to: training_curves.png")
+
+# =====================================================================
+# 11. VISUALIZE SAMPLE PREDICTIONS
+# =====================================================================
+def visualize_predictions(model, loader, device, n_samples=4):
+    model.eval()
+    images, masks = next(iter(loader))
+    images = images.to(device)
+
+    with torch.no_grad():
+        preds = model(images)
+
+    preds_binary = (preds > 0.5).float()
+
+    fig, axes = plt.subplots(n_samples, 3, figsize=(12, n_samples * 4))
+    fig.suptitle("Tree Segmentation: Input | Ground Truth | Prediction", fontsize=14)
+
+    # Denormalize for display
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+    for i in range(n_samples):
+        img = images[i].cpu() * std + mean
+        img = img.permute(1, 2, 0).clamp(0, 1).numpy()
+
+        gt_mask  = masks[i, 0].numpy()
+        pred_mask = preds_binary[i, 0].cpu().numpy()
+
+        axes[i, 0].imshow(img)
+        axes[i, 0].set_title("Input Image")
+        axes[i, 0].axis("off")
+
+        axes[i, 1].imshow(gt_mask, cmap="Greens")
+        axes[i, 1].set_title("Ground Truth (Tree=1)")
+        axes[i, 1].axis("off")
+
+        axes[i, 2].imshow(pred_mask, cmap="Greens")
+        axes[i, 2].set_title("Prediction (Tree=1)")
+        axes[i, 2].axis("off")
+
+    plt.tight_layout()
+    plt.savefig("sample_predictions.png", dpi=150)
+    plt.show()
+    print("Sample predictions saved to: sample_predictions.png")
+
+print("\nLoading best model for visualization...")
+model.load_state_dict(torch.load("unet_tree_seg_best.pth", map_location=DEVICE))
+visualize_predictions(model, test_loader, DEVICE)
