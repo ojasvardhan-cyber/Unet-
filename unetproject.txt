@@ -1,6 +1,4 @@
-# =====================================================================
-# 1. SETUP AND CONFIGURATIONS
-# =====================================================================
+1. SETUP AND CONFIGURATIONS
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -22,9 +20,7 @@ PIN_MEMORY = DEVICE == "cuda"  # Only useful with GPU
 
 print(f"Using device: {DEVICE}")
 
-# =====================================================================
-# 2. DATA AUGMENTATIONS (ALBUMENTATIONS)
-# =====================================================================
+2. DATA AUGMENTATIONS (ALBUMENTATIONS)
 train_transform = A.Compose([
     A.Resize(IMAGE_SIZE, IMAGE_SIZE),
     A.HorizontalFlip(p=0.5),
@@ -40,9 +36,7 @@ val_transform = A.Compose([
     ToTensorV2(),
 ])
 
-# =====================================================================
-# 3. DATASET CLASS
-# =====================================================================
+3. DATASET CLASS
 class TreeDataset(Dataset):
     def __init__(self, hf_dataset_split, transform=None):
         self.dataset = hf_dataset_split
@@ -73,9 +67,7 @@ class TreeDataset(Dataset):
 
         return image, mask
 
-# =====================================================================
-# 4. DICE LOSS (handles class imbalance — trees are a small fraction)
-# =====================================================================
+4. DICE LOSS (handles class imbalance — trees are a small fraction)
 def dice_loss(pred, target, smooth=1.0):
     # pred and target: (B, 1, H, W)
     intersection = (pred * target).sum(dim=(2, 3))
@@ -88,9 +80,7 @@ def combined_loss(pred, target):
     d_loss = dice_loss(pred, target)
     return bce + d_loss
 
-# =====================================================================
-# 5. U-NET ARCHITECTURE
-# =====================================================================
+5. U-NET ARCHITECTURE
 class DoubleConv(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
@@ -151,9 +141,7 @@ class UNet(nn.Module):
 
         return torch.sigmoid(self.final_conv(x))
 
-# =====================================================================
-# 6. EVALUATION FUNCTION (IoU + loss on validation set)
-# =====================================================================
+6. EVALUATION FUNCTION (IoU + loss on validation set)
 def evaluate(model, loader, device):
     model.eval()
     total_loss, total_iou = 0.0, 0.0
@@ -178,9 +166,7 @@ def evaluate(model, loader, device):
     avg_iou = total_iou / len(loader)
     return avg_loss, avg_iou
 
-# =====================================================================
-# 7. LOAD DATASET & INITIALIZE
-# =====================================================================
+7. LOAD DATASET & INITIALIZE
 print("Loading dataset from Hugging Face...")
 hf_ds = load_dataset("restor/tcd")
 
@@ -198,9 +184,7 @@ optimizer = optim.Adam(model.parameters(), lr=LR)
 # LR scheduler: halves LR if val loss stops improving for 2 epochs
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=2, factor=0.5)
 
-# =====================================================================
-# 8. PRE-FLIGHT DATA CHECK
-# =====================================================================
+8. PRE-FLIGHT DATA CHECK
 print("\n--- RUNNING PRE-FLIGHT DATA CHECK ---")
 images, masks = next(iter(train_loader))
 
@@ -215,9 +199,7 @@ if len(unique_vals) <= 1:
 else:
     print("✅ Data integrity verified. Proceeding to training.\n")
 
-# =====================================================================
-# 9. TRAINING LOOP WITH VALIDATION AND BEST MODEL SAVING
-# =====================================================================
+9. TRAINING LOOP WITH VALIDATION AND BEST MODEL SAVING
 train_losses, val_losses, val_ious = [], [], []
 best_val_iou = 0.0
 best_epoch = 0
@@ -271,9 +253,7 @@ print("\n" + "=" * 60)
 print(f"Training complete. Best Val IoU: {best_val_iou:.4f} at epoch {best_epoch}")
 print("Best model saved to: unet_tree_seg_best.pth")
 
-# =====================================================================
-# 10. PLOT TRAINING CURVES
-# =====================================================================
+10. PLOT TRAINING CURVES
 epochs_range = range(1, EPOCHS + 1)
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
@@ -299,9 +279,7 @@ plt.savefig("training_curves.png", dpi=150)
 plt.show()
 print("Training curves saved to: training_curves.png")
 
-# =====================================================================
-# 11. VISUALIZE SAMPLE PREDICTIONS
-# =====================================================================
+11. VISUALIZE SAMPLE PREDICTIONS
 def visualize_predictions(model, loader, device, n_samples=4):
     model.eval()
     images, masks = next(iter(loader))
